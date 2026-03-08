@@ -35,34 +35,144 @@ def anthropic_to_openai_messages(anthropic_messages: list[dict], system: str | N
         role = msg.get("role", "user")
         content = msg.get("content", "")
         
-        # 处理多模态内容
+        # 处理多模态内容（可能包含 tool_result、tool_use 等）
         if isinstance(content, list):
-            openai_content = []
+            text_parts = []
+            tool_results = []  # tool_result 消息列表
+            tool_call_parts = []  # tool_use 消息列表
+            has_non_tool_content = False
+            
             for item in content:
-                if isinstance(item, dict):
-                    item_type = item.get("type", "text")
-                    if item_type == "text":
-                        openai_content.append({
-                            "type": "text",
-                            "text": item.get("text", "")
-                        })
-                    elif item_type == "image":
-                        # 处理图片
-                        source = item.get("source", {})
-                        if source.get("type") == "base64":
-                            media_type = source.get("media_type", "image/png")
-                            data = source.get("data", "")
-                            openai_content.append({
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{media_type};base64,{data}"
-                                }
-                            })
-            openai_messages.append({"role": role, "content": openai_content})
+                if not isinstance(item, dict):
+                    continue
+                    
+                item_type = item.get("type", "text")
+                
+                if item_type == "text":
+                    text = item.get("text", "")
+                    if text:
+                        text_parts.append(text)
+                        has_non_tool_content = True
+                        
+                elif item_type == "image":
+                    # 处理图片
+                    source = item.get("source", {})
+                    if source.get("type") == "base64":
+                        has_non_tool_content = True
+                        # 图片会放在 text_parts 后面一起处理
+                        
+                elif item_type == "tool_result":
+                    # 处理工具调用结果 - 转换为 OpenAI 的 tool 角色消息
+                    tool_content = item.get("content", "")
+                    tool_call_id = item.get("tool_use_id", "")
+                    
+                    # 提取工具结果内容
+                    result_text = ""
+                    if isinstance(tool_content, list):
+                        for tc in tool_content:
+                            if isinstance(tc, dict) and tc.get("type") == "text":
+                                t = tc.get("text", "")
+                                if t:
+                                    result_text += t + "\n"
+                    elif isinstance(tool_content, str):
+                        result_text = tool_content
+                    
+                    # OpenAI 要求 tool 结果不能为空
+                    if not result_text or not result_text.strip():
+                        result_text = "(tool executed successfully)"
+                    
+                    tool_results.append({
+                        "role": "tool",
+                        "content": result_text.strip(),
+                        "tool_call_id": tool_call_id
+                    })
+                    
+                elif item_type == "tool_use":
+                    # 工具调用请求 - 转换为 OpenAI tool_calls
+                    tool_call_parts.append({
+                        "id": item.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name", ""),
+                            "arguments": json.dumps(item.get("input", {}))
+                        }
+                    })
+            
+            # 构建消息
+            if role == "assistant" and tool_call_parts:
+                # Assistant 的 tool_use 请求
+                openai_msg = {
+                    "role": "assistant",
+                    "content": "\n".join(text_parts) if text_parts else None,
+                    "tool_calls": tool_call_parts
+                }
+                openai_messages.append(openai_msg)
+            elif tool_results and not has_non_tool_content:
+                # User 消息只包含 tool_result - 拆分为多个 tool 消息
+                for tr in tool_results:
+                    openai_messages.append(tr)
+            else:
+                # 普通消息（可能混合了文本和工具结果）
+                final_content = "\n".join(text_parts) if text_parts else ""
+                if not final_content.strip():
+                    final_content = "(tool result)" if tool_results else "..."
+                openai_messages.append({"role": role, "content": final_content})
+                # 如果有工具结果，额外添加
+                for tr in tool_results:
+                    openai_messages.append(tr)
+                    
         else:
+            # 字符串内容
+            if not content or not str(content).strip():
+                # 空内容处理
+                if role == "user":
+                    content = "(empty)"
+                else:
+                    content = "..."
             openai_messages.append({"role": role, "content": content})
     
+    # 清理：移除连续的相同角色消息（OpenAI 要求 alternating roles）
+    openai_messages = merge_consecutive_messages(openai_messages)
+    
     return openai_messages
+
+
+def merge_consecutive_messages(messages: list[dict]) -> list[dict]:
+    """合并连续的相同角色消息（OpenAI 要求角色交替）"""
+    if not messages:
+        return messages
+    
+    result = [messages[0]]
+    
+    for msg in messages[1:]:
+        last_msg = result[-1]
+        if msg["role"] == last_msg["role"]:
+            # 合并相同角色的消息
+            last_content = last_msg.get("content", "")
+            current_content = msg.get("content", "")
+            
+            # 处理不同类型的 content
+            if isinstance(last_content, list) or isinstance(current_content, list):
+                # 至少有一个是列表，都转为列表
+                if not isinstance(last_content, list):
+                    last_content = [{"type": "text", "text": last_content}] if last_content else []
+                if not isinstance(current_content, list):
+                    current_content = [{"type": "text", "text": current_content}] if current_content else []
+                last_msg["content"] = last_content + current_content
+            else:
+                # 都是字符串
+                sep = "\n" if last_content and current_content else ""
+                last_msg["content"] = str(last_content or "") + sep + str(current_content or "")
+            
+            # 合并 tool_calls（如果有）
+            if "tool_calls" in msg:
+                if "tool_calls" not in last_msg:
+                    last_msg["tool_calls"] = []
+                last_msg["tool_calls"].extend(msg["tool_calls"])
+        else:
+            result.append(msg)
+    
+    return result
 
 
 def anthropic_to_openai_request(anthropic_body: dict) -> dict:
